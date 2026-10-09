@@ -1,0 +1,225 @@
+{
+  "apiVersion": "v1",
+  "kind": "List",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "kind": "ConfigMap",
+      "metadata": {
+        "name": "w5-code",
+        "namespace": "default",
+        "labels": {
+          "lesson": "week5b"
+        }
+      },
+      "data": {
+        "app.py": "\"\"\"CS 370 teaching example. Local demo only; no authentication or production guarantees.\"\"\"\nimport json, os, time\nfrom flask import Flask, request, jsonify, render_template_string\nimport psycopg\nfrom psycopg.rows import dict_row\nimport redis\nfrom kafka import KafkaProducer, KafkaConsumer\n\nDSN = os.environ['DATABASE_URL']\nBROKER = os.environ.get('KAFKA_BOOTSTRAP_SERVERS', 'w5-kafka:9092')\nTOPIC = 'w5-orders'\ncache = redis.Redis(host='w5-redis', decode_responses=True,\n                    socket_connect_timeout=1, socket_timeout=1)\napp = Flask(__name__)\n\ndef db():\n    return psycopg.connect(DSN, row_factory=dict_row, connect_timeout=3)\n\ndef initialize():\n    for attempt in range(120):\n        try:\n            with db() as conn:\n                conn.execute('''CREATE TABLE IF NOT EXISTS orders (\n                    id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\n                    item text NOT NULL, status text NOT NULL DEFAULT 'pending')''')\n            return\n        except Exception:\n            time.sleep(2)\n    raise RuntimeError('Database did not become available')\n\ndef producer():\n    return KafkaProducer(bootstrap_servers=BROKER, acks='all', retries=3,\n        max_block_ms=10000, request_timeout_ms=10000,\n        key_serializer=lambda k: str(k).encode(),\n        value_serializer=lambda v: json.dumps(v).encode())\n\n@app.get('/health')\ndef health():\n    return 'ok'\n\n@app.get('/')\ndef home():\n    return render_template_string('''<!doctype html><title>CS 370 Order Demo</title>\n    <style>body{font:20px system-ui;max-width:850px;margin:45px auto;padding:20px}\n    button,input{font:inherit;padding:8px}pre{white-space:pre-wrap;background:#eee;padding:20px}</style>\n    <h1>Our small order system</h1><p>Web app · PostgreSQL · Kafka · Redis</p>\n    <input id=\"item\" value=\"Coffee\"><button onclick=\"place()\">Place order</button>\n    <p>Order ID: <input id=\"oid\" type=\"number\" value=\"1\" style=\"width:85px\">\n    <button onclick=\"lookup()\">Look up order</button></p><pre id=\"result\">Place an order to begin.</pre>\n    <p>Look up the same order twice. Watch the source change from database to cache.</p>\n    <script>\n    async function place(){let r=await fetch('/orders',{method:'POST',headers:{'Content-Type':'application/json'},\n    body:JSON.stringify({item:document.getElementById('item').value})});let d=await r.json();\n    if(d.id)document.getElementById('oid').value=d.id;document.getElementById('result').textContent=JSON.stringify(d,null,2);}\n    async function lookup(){let r=await fetch('/orders/'+document.getElementById('oid').value);\n    document.getElementById('result').textContent=JSON.stringify(await r.json(),null,2);}\n    </script>''')\n\n@app.post('/orders')\ndef place_order():\n    item = str((request.get_json(silent=True) or {}).get('item', '')).strip()\n    if not item or len(item) > 80:\n        return jsonify(error='Use an item name of 1 to 80 characters'), 400\n    with db() as conn:\n        row = conn.execute('INSERT INTO orders(item) VALUES (%s) RETURNING *', (item,)).fetchone()\n    # Teaching simplification: DB commit and Kafka send are two separate operations.\n    # A production system needs a reliable bridge (e.g. an outbox) and retry handling.\n    p = None\n    try:\n        p = producer()\n        p.send(TOPIC, key=row['id'], value={'order_id': row['id']}).get(timeout=15)\n        return jsonify(**row, event_published=True), 201\n    except Exception:\n        app.logger.exception('Order saved but event publication failed')\n        return jsonify(**row, event_published=False,\n                       warning='Order saved, but worker was not notified. Ask the instructor.'), 503\n    finally:\n        if p:\n            p.close(timeout=2)\n\n@app.get('/orders/<int:oid>')\ndef get_order(oid):\n    key = f'order:{oid}'\n    try:\n        saved = cache.get(key)\n        if saved:\n            return jsonify(order=json.loads(saved), source='cache')\n    except redis.RedisError:\n        app.logger.warning('Cache unavailable; reading database')\n    with db() as conn:\n        row = conn.execute('SELECT * FROM orders WHERE id=%s', (oid,)).fetchone()\n    if not row:\n        return jsonify(error='Order not found'), 404\n    try:\n        cache.setex(key, 20, json.dumps(row))\n    except redis.RedisError:\n        pass\n    return jsonify(order=row, source='database')\n\ndef worker():\n    while True:\n        consumer = None\n        try:\n            consumer = KafkaConsumer(TOPIC, bootstrap_servers=BROKER,\n                group_id='w5-packers', auto_offset_reset='earliest',\n                enable_auto_commit=False,\n                value_deserializer=lambda v: json.loads(v.decode()))\n            for message in consumer:\n                oid = int(message.value['order_id'])\n                time.sleep(2)  # Simulate packing, without email or another external service.\n                with db() as conn:\n                    conn.execute(\"UPDATE orders SET status='packed' WHERE id=%s\", (oid,))\n                try:\n                    cache.delete(f'order:{oid}')\n                except redis.RedisError:\n                    pass  # Existing entries also expire after 20 seconds.\n                consumer.commit()\n                print(f'Packed order {oid}; committed offset', flush=True)\n        except Exception as exc:\n            print(f'Worker waiting/retrying: {exc}', flush=True)\n            time.sleep(3)\n        finally:\n            if consumer:\n                consumer.close()\n\nif __name__ == '__main__':\n    initialize()\n    if os.environ.get('ROLE') == 'worker':\n        worker()\n    else:\n        app.run(host='0.0.0.0', port=8080, threaded=False)\n",
+        "requirements.txt": "Flask==3.1.2\npsycopg[binary]==3.2.10\nredis==6.4.0\nkafka-python==2.2.15\n"
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "name": "w5-web",
+        "namespace": "default",
+        "labels": {
+          "lesson": "week5b"
+        }
+      },
+      "spec": {
+        "selector": {
+          "app": "w5-web"
+        },
+        "ports": [
+          {
+            "port": 8080,
+            "targetPort": 8080
+          }
+        ]
+      }
+    },
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "name": "w5-web",
+        "namespace": "default",
+        "labels": {
+          "lesson": "week5b"
+        }
+      },
+      "spec": {
+        "replicas": 1,
+        "strategy": {
+          "type": "Recreate"
+        },
+        "selector": {
+          "matchLabels": {
+            "app": "w5-web"
+          }
+        },
+        "template": {
+          "metadata": {
+            "labels": {
+              "app": "w5-web",
+              "lesson": "week5b"
+            }
+          },
+          "spec": {
+            "containers": [
+              {
+                "name": "w5-web",
+                "image": "python:3.12-slim",
+                "command": [
+                  "sh",
+                  "-c",
+                  "pip install --no-cache-dir -r /code/requirements.txt && exec python -u /code/app.py"
+                ],
+                "env": [
+                  {
+                    "name": "ROLE",
+                    "value": "web"
+                  },
+                  {
+                    "name": "DATABASE_URL",
+                    "value": "postgresql://demo:classroom-only@w5-db:5432/orders"
+                  },
+                  {
+                    "name": "KAFKA_BOOTSTRAP_SERVERS",
+                    "value": "w5-kafka:9092"
+                  }
+                ],
+                "volumeMounts": [
+                  {
+                    "name": "code",
+                    "mountPath": "/code",
+                    "readOnly": true
+                  }
+                ],
+                "resources": {
+                  "requests": {
+                    "memory": "96Mi",
+                    "cpu": "100m"
+                  },
+                  "limits": {
+                    "memory": "384Mi",
+                    "cpu": "1"
+                  }
+                },
+                "readinessProbe": {
+                  "httpGet": {
+                    "path": "/health",
+                    "port": 8080
+                  },
+                  "periodSeconds": 3
+                }
+              }
+            ],
+            "volumes": [
+              {
+                "name": "code",
+                "configMap": {
+                  "name": "w5-code"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "name": "w5-worker",
+        "namespace": "default",
+        "labels": {
+          "lesson": "week5b"
+        }
+      },
+      "spec": {
+        "replicas": 1,
+        "strategy": {
+          "type": "Recreate"
+        },
+        "selector": {
+          "matchLabels": {
+            "app": "w5-worker"
+          }
+        },
+        "template": {
+          "metadata": {
+            "labels": {
+              "app": "w5-worker",
+              "lesson": "week5b"
+            }
+          },
+          "spec": {
+            "containers": [
+              {
+                "name": "w5-worker",
+                "image": "python:3.12-slim",
+                "command": [
+                  "sh",
+                  "-c",
+                  "pip install --no-cache-dir -r /code/requirements.txt && exec python -u /code/app.py"
+                ],
+                "env": [
+                  {
+                    "name": "ROLE",
+                    "value": "worker"
+                  },
+                  {
+                    "name": "DATABASE_URL",
+                    "value": "postgresql://demo:classroom-only@w5-db:5432/orders"
+                  },
+                  {
+                    "name": "KAFKA_BOOTSTRAP_SERVERS",
+                    "value": "w5-kafka:9092"
+                  }
+                ],
+                "volumeMounts": [
+                  {
+                    "name": "code",
+                    "mountPath": "/code",
+                    "readOnly": true
+                  }
+                ],
+                "resources": {
+                  "requests": {
+                    "memory": "96Mi",
+                    "cpu": "100m"
+                  },
+                  "limits": {
+                    "memory": "384Mi",
+                    "cpu": "1"
+                  }
+                },
+                "readinessProbe": {
+                  "exec": {
+                    "command": [
+                      "sh",
+                      "-c",
+                      "tr '\\000' ' ' </proc/1/cmdline | grep -q python"
+                    ]
+                  },
+                  "initialDelaySeconds": 5,
+                  "periodSeconds": 3
+                }
+              }
+            ],
+            "volumes": [
+              {
+                "name": "code",
+                "configMap": {
+                  "name": "w5-code"
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
